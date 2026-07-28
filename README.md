@@ -61,6 +61,7 @@ Each Guardian's trust score is tracked as `vero_reputation` on their Stellar acc
 ┌──────────────────────────────────────────────────────────────────────┐
 │                       Vero Relayer  (index.js)                        │
 │                                                                       │
+│   • Rate-limits requests, verifies X-Hub-Signature-256 HMAC           │
 │   • Validates action === 'closed' && pull_request.merged === true     │
 │   • Checks labels includes 'wave-contribution'                        │
 │   • Calls registerTaskOnChain(prNumber)  ──►  stellar.js             │
@@ -152,6 +153,15 @@ castVote(prId, publicKey)  [stellar-interact.ts]
 ```
 GitHub Webhook  ──►  POST /github-webhook
                               │
+                    ┌─────────▼──────────┐
+                    │  Rate limit check   │  429 if exceeded
+                    └─────────┬──────────┘
+                              │ pass
+                    ┌─────────▼──────────┐
+                    │ Verify HMAC-SHA256  │  401 if missing/invalid
+                    │ X-Hub-Signature-256 │
+                    └─────────┬──────────┘
+                              │ pass
                     ┌─────────▼──────────┐
                     │  Validate payload   │
                     │  action === 'closed'│
@@ -261,14 +271,14 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ### Run the Relayer
 
-The relayer is a separate Express server that listens for GitHub webhooks:
+The relayer is a separate Express server that listens for GitHub webhooks. It requires `GITHUB_WEBHOOK_SECRET` to be set — requests without a valid `X-Hub-Signature-256` signature are rejected with `401` (see [Webhook Relayer](#webhook-relayer)):
 
 ```bash
 # Start the webhook relayer on port 3000
-node index.js
+GITHUB_WEBHOOK_SECRET=devsecret node index.js
 
-# In another terminal, fire a simulated webhook
-npm run simulate
+# In another terminal, fire a simulated (signed) webhook
+GITHUB_WEBHOOK_SECRET=devsecret npm run simulate
 ```
 
 Expected relayer output:
@@ -318,6 +328,9 @@ STELLAR_NETWORK=testnet
 RELAYER_VAULT_KEY_PROVIDER=hardware
 RELAYER_VAULT_HARDWARE_BACKED=true
 RELAYER_VAULT_STELLAR_SECRET_KEY={...encrypted vault record...}
+
+# Shared secret used to verify the GitHub webhook's X-Hub-Signature-256 header
+GITHUB_WEBHOOK_SECRET=
 ```
 
 | Variable | Description | Default |
@@ -329,6 +342,7 @@ RELAYER_VAULT_STELLAR_SECRET_KEY={...encrypted vault record...}
 | `RELAYER_VAULT_KEY_PROVIDER` | Hardware-backed vault key provider identifier | `hardware` |
 | `RELAYER_VAULT_HARDWARE_BACKED` | Must be `true` when relayer vault keys are backed by OS/HSM storage | — |
 | `RELAYER_VAULT_STELLAR_SECRET_KEY` | Encrypted vault record for the relayer signing key | — |
+| `GITHUB_WEBHOOK_SECRET` | Shared secret used to verify the `X-Hub-Signature-256` HMAC header on `/github-webhook` requests. Requests without a valid signature are rejected with `401`. | — |
 
 > **Security:** Do not store raw relayer secrets such as `STELLAR_SECRET_KEY` in `.env` files. Store encrypted vault records and unwrap them with a hardware-backed provider.
 
@@ -686,17 +700,47 @@ The pure helpers `buildHeatmap()`, `findHotspots()`, and `formatGas()` are expor
 
 ### Webhook Relayer
 
-The relayer (`index.js`) is a lightweight Express server that ingests GitHub webhooks and registers qualifying PRs on-chain:
+The relayer (`index.js`) is a lightweight Express server that ingests GitHub webhooks and registers qualifying PRs on-chain. Every request to `/github-webhook` must pass two gates before any body-derived logic runs:
+
+1. **Signature verification** — the raw request body is captured via `express.json({ verify })`, and the `X-Hub-Signature-256` header is checked with HMAC-SHA256 (using `GITHUB_WEBHOOK_SECRET`) and `crypto.timingSafeEqual`. Missing, malformed, or invalid signatures get `401` and `registerTaskOnChain` is never called.
+2. **Rate limiting** — `express-rate-limit` throttles the route (default: 30 requests/minute per source), returning `429` once the limit is exceeded.
 
 ```javascript
 // index.js
+const crypto = require('crypto');
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const { registerTaskOnChain } = require('./stellar');
 
 const app = express();
-app.use(express.json());
 
-app.post('/github-webhook', async (req, res) => {
+// Capture the raw body so the HMAC signature can be verified against the
+// exact bytes GitHub signed (JSON.parse output would not match).
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+function verifyGithubSignature(req, res, next) {
+  const secret = process.env.GITHUB_WEBHOOK_SECRET;
+  const signature = req.headers['x-hub-signature-256'];
+  if (!secret || !signature) return res.status(401).json({ error: 'Invalid signature' });
+
+  const digest = crypto.createHmac('sha256', secret).update(req.rawBody || Buffer.alloc(0)).digest('hex');
+  const expected = Buffer.from(`sha256=${digest}`);
+  const received = Buffer.from(signature);
+
+  if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+  next();
+}
+
+app.post('/github-webhook', webhookLimiter, verifyGithubSignature, async (req, res) => {
   const { action, pull_request } = req.body;
 
   // Only process merged PRs
@@ -726,6 +770,8 @@ app.listen(process.env.PORT || 3000, () =>
   console.log(`[relayer] Listening on port ${process.env.PORT || 3000}`)
 );
 ```
+
+Configure the shared secret in GitHub's webhook settings and in the relayer environment as `GITHUB_WEBHOOK_SECRET` (see [Environment Variables](#environment-variables)). `scripts/mock-webhook.js` signs its payload with the same secret so local simulation exercises the real verification path.
 
 The `stellar.js` module handles transaction compilation:
 
@@ -761,29 +807,31 @@ To test the relayer without a live GitHub webhook:
 
 ```javascript
 // scripts/mock-webhook.js
-const payload = {
-  action: 'closed',
-  pull_request: {
-    number: 42,
-    merged: true,
-    labels: [{ name: 'wave-contribution' }],
-  },
-};
+const crypto = require('crypto');
 
-fetch('http://localhost:3000/github-webhook', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify(payload),
-})
+const payload = { /* ... action: 'closed', pull_request: { ... } */ };
+const body = JSON.stringify(payload);
+const secret = process.env.GITHUB_WEBHOOK_SECRET;
+
+const headers = { 'Content-Type': 'application/json' };
+if (secret) {
+  const digest = crypto.createHmac('sha256', secret).update(body).digest('hex');
+  headers['X-Hub-Signature-256'] = `sha256=${digest}`;
+}
+
+fetch('http://localhost:3000/github-webhook', { method: 'POST', headers, body })
   .then(res => res.json())
   .then(data => console.log('[mock-webhook] Response:', data))
   .catch(err => console.error('[mock-webhook] Error:', err.message));
 ```
 
 ```bash
-npm run simulate
+GITHUB_WEBHOOK_SECRET=devsecret node index.js &
+GITHUB_WEBHOOK_SECRET=devsecret npm run simulate
 # [mock-webhook] Response: { registered: true, prNumber: 42, result: { ... } }
 ```
+
+Running `npm run simulate` without `GITHUB_WEBHOOK_SECRET` set sends an unsigned request, which the relayer now rejects with `401`.
 
 ---
 
@@ -792,6 +840,10 @@ npm run simulate
 ### `POST /github-webhook`
 
 Receives GitHub webhook events. Only processes `closed` + `merged` PRs with the `wave-contribution` label.
+
+**Authentication:** requires a valid `X-Hub-Signature-256` header — an HMAC-SHA256 hex digest of the raw request body, prefixed with `sha256=`, keyed with `GITHUB_WEBHOOK_SECRET`. Missing or invalid signatures return `401` before the body is inspected.
+
+**Rate limiting:** the route is throttled (default 30 requests/minute per source); requests over the limit return `429`.
 
 **Request body** (GitHub webhook format):
 
@@ -829,6 +881,18 @@ Receives GitHub webhook events. Only processes `closed` + `merged` PRs with the 
 
 ```json
 { "skipped": true, "reason": "no wave-contribution label" }
+```
+
+**Response — unauthorized (missing/invalid signature):**
+
+```json
+{ "error": "Invalid signature" }
+```
+
+**Response — rate limited:**
+
+```json
+{ "error": "Too many requests" }
 ```
 
 ---
@@ -962,5 +1026,5 @@ Before going to mainnet:
 - [ ] Set all `NEXT_PUBLIC_*` vars in Vercel (or your hosting provider)
 - [ ] Enable HTTPS — Freighter requires a secure context (`https://`)
 - [ ] Add CSP headers allowing Stellar Horizon and Soroban RPC origins
-- [ ] Configure GitHub webhook secret and validate `X-Hub-Signature-256` in the relayer
-- [ ] Rate-limit the `/github-webhook` endpoint
+- [x] Configure GitHub webhook secret and validate `X-Hub-Signature-256` in the relayer
+- [x] Rate-limit the `/github-webhook` endpoint
